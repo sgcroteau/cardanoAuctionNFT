@@ -1,0 +1,138 @@
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
+
+module AuctionNFT
+  ( NFT (..),
+    Bid (..),
+    AuctionSchema,
+    AuctionParams (..),
+    BidParams (..),
+    CloseParams (..),
+    CollectParams (..),
+    lock,
+    bid,
+    close,
+    collect,
+  )
+where
+
+import Control.Monad hiding (fmap)
+import Data.Aeson (FromJSON, ToJSON)
+import Data.Map as Map
+import Data.Text (Text)
+import GHC.Generics (Generic)
+import Ledger
+import Ledger.Constraints as Constraints
+import qualified Ledger.Typed.Scripts as Scripts
+import Ledger.Value as Value
+import Plutus.Contract as Contract
+import Plutus.Trace.Emulator as Emulator
+import qualified PlutusTx
+import PlutusTx.Prelude hiding (Semigroup (..), unless)
+import qualified Prelude as P
+
+-- Define the data type for the NFT, which includes the owner, the current highest bidder, and the current highest bid amount.
+data NFT = NFT
+  { owner :: PubKeyHash,
+    highestBidder :: Maybe PubKeyHash,
+    highestBid :: Integer
+  }
+  deriving (Show, Generic, FromJSON, ToJSON, P.Eq, PlutusTx.ToData, PlutusTx.FromData)
+
+PlutusTx.makeLift ''NFT
+
+-- Define data types for the auction parameters, bid parameters, close parameters, and collect parameters.
+data AuctionParams = AuctionParams
+  { nft :: NFT,
+    deadline :: Slot
+  }
+  deriving (Show, Generic, FromJSON, ToJSON, P.Eq, PlutusTx.ToData, PlutusTx.FromData)
+
+PlutusTx.makeLift ''AuctionParams
+
+data Bid = Bid
+  { bidder :: PubKeyHash,
+    bidAmount :: Integer
+  }
+  deriving (Show, Generic, FromJSON, ToJSON, P.Eq, PlutusTx.ToData, PlutusTx.FromData)
+
+PlutusTx.makeLift ''Bid
+
+data BidParams = BidParams
+  { nft :: NFT,
+    deadline :: Slot,
+    bid :: Bid
+  }
+  deriving (Show, Generic, FromJSON, ToJSON, P.Eq, PlutusTx.ToData, PlutusTx.FromData)
+
+PlutusTx.makeLift ''BidParams
+
+data CloseParams = CloseParams
+  { nft :: NFT,
+    bid :: Bid
+  }
+  deriving (Show, Generic, FromJSON, ToJSON, P.Eq, PlutusTx.ToData, PlutusTx.FromData)
+
+PlutusTx.makeLift ''CloseParams
+
+data CollectParams = CollectParams
+  { nft :: NFT,
+    bid :: Bid
+  }
+  deriving (Show, Generic, FromJSON, ToJSON, P.Eq, PlutusTx.ToData, PlutusTx.FromData)
+
+PlutusTx.makeLift ''CollectParams
+
+-- Define the schema for the auction, which includes the endpoints for the lock, bid, close, and collect functions.
+type AuctionSchema =
+  Endpoint "lock" () -- Not used in this particular smart contract.
+    .\/ Endpoint "bid" BidParams
+    .\/ Endpoint "close" CloseParams
+    .\/ Endpoint "collect" CollectParams
+
+-- Define the `validBid` function, which checks if a bid is higher than the current highest bid for the NFT.
+{-# INLINABLE validBid #-}
+validBid :: Bid -> NFT -> Bool
+validBid bid nft =
+  bidAmount bid > highestBid nft
+
+-- Define the `updateNFT` function, which updates the NFT with a new highest bidder and bid amount.
+{-# INLINABLE updateNFT #-}
+updateNFT :: Bid -> NFT -> NFT
+updateNFT bid nft =
+  nft
+    { highestBidder = Just $ bidder bid,
+      highestBid = bidAmount bid
+    }
+
+-- Define the `mkAuctionValidator` function, which is the main validator function for the smart contract.
+-- It takes four parameters: `ap` (an `AuctionParams` value), `bp` (a `BidParams` value), `cp` (a `CloseParams` value), and `xp` (a `CollectParams` value).
+-- It first checks if the bid amount is  Continuing from the previous answer, here are the comments for the rest of the code:
+
+```haskell
+-- higher than the current highest bid using the `validBid` function. If the bid is not valid, it returns an error message.
+-- Otherwise, it checks which endpoint is being called (`Bid`, `Close`, or `Collect`) and performs the appropriate action.
+{-# INLINABLE mkAuctionValidator #-}
+mkAuctionValidator :: AuctionParams -> Bid -> CloseParams -> CollectParams -> ValidatorCtx -> Bool
+mkAuctionValidator ap bp cp xp _ =
+  if not $ validBid (bid bp) (nft ap)
+    then False
+    else case xp of
+      -- Bid endpoint
+      CollectParams {nft = nft', bid = bid'} ->
+        let newNFT = updateNFT bid' nft'
+            tx = mustPayToTheScript newNFT $ Ada.lovelaceValueOf $ bidAmount bid'
+        in (slot $ deadline ap) >= (slot $ txInfoValidRange tx).end
+      -- Close endpoint
+      CloseParams {nft = nft', bid = bid'} ->
+        (owner nft' == ownPubKeyHash cp) && (highestBidder nft' == Just (bidder bid')) && (highestBid nft' == bidAmount bid')
+      -- Collect endpoint
+      CollectParams {nft = nft', bid = bid'} ->
+        (owner nft' == ownPubKeyHash cp) && (highestBidder nft' == Just (bidder bid'))
